@@ -24,6 +24,14 @@
     <a class="btn" href="{{ url_for('geojson', batch_id=batch.id) }}">下载本批道路 GeoJSON</a>
     <span class="muted">导出为只读快照，导出期间其他批次仍可提交。</span>
   </p>
+  {% elif batch.status == 'processing' %}
+  <p class="muted">
+    该批次正在解析/合并中，详情链接（#{{ batch.id }}）已固定不变。
+    提交完成后本页会显示本批固定快照：只含本批及此前已提交批次，绝不含当时仍在处理或已失败的批次；
+    后续批次也不会改变本批的道路坐标、待补全列表与统计。
+  </p>
+  {% else %}
+  <p class="muted">该批次已拒绝，未留下任何半批数据，也不属于任何批次的快照。</p>
   {% endif %}
 </div>
 

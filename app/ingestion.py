@@ -16,6 +16,15 @@ Merge semantics for every parsed element, keyed by (object type, id, version):
 
 All of this happens inside one ``BEGIN IMMEDIATE`` transaction together with
 the batch's status flip, so each batch takes effect atomically.
+
+Snapshot position
+-----------------
+The batch id is reserved before parsing (so a slow upload is visible in the
+listing while it is still being parsed), which means ids are *not* commit
+order.  The commit transaction therefore also allocates ``commit_seq`` from
+:func:`app.db.next_commit_seq`; snapshots are fixed by that sequence, not by
+the id.  A batch that is still parsing / later rejected never receives a
+sequence and is invisible to every snapshot.
 """
 from __future__ import annotations
 
@@ -23,6 +32,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
+from .db import next_commit_seq, owner_token, recover_stale_batches
 from .osm_parser import ParsedElement, parse_osm, OSMParseError
 
 COORD_DECIMALS = 7  # OSM stores at most 7 decimal places (~1 cm).
@@ -77,12 +87,23 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
     batch row (with the reason) remains for auditing.  ``BatchRejected`` /
     ``OSMParseError`` carry the human-readable reason.
     """
+    # Any 'processing' row whose owning process is gone is a leftover from a
+    # crash (e.g. a worker killed outside a normal container restart).  Clear
+    # it before reserving our own id, so the fast path does not need a
+    # startup-only recovery, while never touching a batch that a live worker
+    # is still parsing.
+    recover_stale_batches(conn)
+
     # 1. Reserve the batch id in its own (auto-commit) statement first, so
     #    that even a parse/validation failure leaves an auditable rejected
-    #    batch row while no object row can survive (the object transaction
-    #    is only opened afterwards).
+    #    batch row, the upload is listed with a fixed detail link while it
+    #    is still being parsed, and the id can never change later.  The
+    #    snapshot position (commit_seq) is allocated separately at commit
+    #    time, so this id does not constrain snapshot ordering.
     cur = conn.execute(
-        "INSERT INTO batches (filename, status) VALUES (?, 'processing')", (filename,)
+        "INSERT INTO batches (filename, status, owner_host, owner_pid, owner_start) "
+        "VALUES (?, 'processing', ?, ?, ?)",
+        (filename, *owner_token()),
     )
     batch_id = cur.lastrowid
 
@@ -166,9 +187,14 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
             else:
                 result.inserted_ways += 1
 
+        # Fix the snapshot position only now, at commit time, so it reflects
+        # exactly the batches that have already committed.  Batches still
+        # parsing (or rejected) are not part of this snapshot.
+        commit_seq = next_commit_seq(conn)
         conn.execute(
-            "UPDATE batches SET status = 'committed', error = NULL WHERE id = ?",
-            (batch_id,),
+            "UPDATE batches SET status = 'committed', error = NULL, commit_seq = ? "
+            "WHERE id = ?",
+            (commit_seq, batch_id),
         )
         conn.execute("COMMIT")
     except (BatchRejected, OSMParseError) as exc:

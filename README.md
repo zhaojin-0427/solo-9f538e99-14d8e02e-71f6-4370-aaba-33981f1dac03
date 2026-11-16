@@ -14,24 +14,27 @@ docker compose up --build
 ```
 
 数据库持久化在命名卷 `osm_batch_data` 中；`samples/` 以只读方式挂载到容器
-`/samples`，可直接在网页上传试用。
+`/samples`，可直接在网页上传试用。已有旧版本数据卷无需迁移命令，容器启动时
+自动原地升级（见下文「批次不可变与并发」）。
 
 本地无 Docker 时的开发启动：
 
 ```bash
 pip install -r requirements.txt
-python -m gunicorn --bind 0.0.0.0:8000 --threads 4 wsgi:app
+python -m gunicorn --bind 0.0.0.0:8000 --worker-class gthread --workers 2 \
+    --threads 8 wsgi:app
 # 或：flask --app wsgi run --debug
 ```
 
 ## 网页操作
 
-1. 首页选择 `.osm` / `.osc` 文件上传，每个文件形成一个批次（自动编号）。
-2. 批次列表显示状态（已提交 / 已拒绝 / 处理中）、本批对象版本数、拒绝原因。
+1. 首页选择 `.osm` / `.osc` 文件上传，每个文件形成一个批次（上传开始即编号）。
+2. 批次列表显示状态（已提交 / 已拒绝 / 处理中）、本批对象版本数、拒绝原因；
+   解析中的批次也立即列出，详情链接固定。
 3. 批次详情页显示：可见/已删除对象统计、可导出道路、待补全道路及缺失节点 id。
 4. 点击「下载本批道路 GeoJSON」得到 `batch_<id>_highways.geojson`
    （GeoJSON FeatureCollection，几何为 LineString，坐标按 lon/lat 顺序）。
-5. `GET /health` 健康检查；拒绝批次的导出返回 HTTP 409。
+5. `GET /health` 健康检查；拒绝或未提交批次的导出返回 HTTP 409。
 
 ## 合并与版本规则
 
@@ -56,13 +59,27 @@ python -m gunicorn --bind 0.0.0.0:8000 --threads 4 wsgi:app
 
 ## 批次不可变与并发
 
-- `object_versions` 是只追加事件表；某批次 B 的快照 = 所有 `batch_id <= B` 的每对象
-  最高版本。后来补传的数据**绝不混入**历史批次：历史批次的节点坐标、way 引用、
-  标签、待补全状态永远保持当时结果。
-- 每批在一个 `BEGIN IMMEDIATE` 事务内完成对象写入与状态翻转；失败即 ROLLBACK，
-  只留下标记 rejected 的批次审计行，不留半批。
-- 进程重启时，启动钩子把残留 `processing` 批次的对象行清除并标记拒绝（崩溃恢复）。
-- WAL + 只读快照查询：导出 GeoJSON 不开启写事务，导出期间新批次仍可提交。
+- 上传开始即预留批次号并写入 `processing` 批次行，因此解析期间该批已出现在列表中，
+  详情链接 `/batches/<id>` 立即可用，**批次号此后永不变更**（即使提交失败也不改号）。
+- 批次号只反映上传开始顺序。每个批次在提交事务内额外分配一个单调递增的
+  `commit_seq`（提交序号）。某批 B 的快照 = 所有 `commit_seq <= B.commit_seq` 的
+  已提交批次中每对象的最高版本。它固定为 B **提交那一刻**的完整入仓状态：含 B 自身
+  及此前已提交批次，**不含当时仍在解析或已失败的批次**。
+- 因此并行上传时，先取得较小批次号但解析较慢的 A 即使晚于 B 提交，也不会改变 B 已
+  发布的道路坐标、待补全列表或统计；A 自己的快照则包含 B（B 在 A 提交前已完成），
+  不会漏掉 B 已补齐的节点。版本合并仍严格按 `(类型, id, version)` 规则执行。
+- `object_versions` 是只追加事件表；已提交批次的 `commit_seq` 永不改变，后续上传、
+  导出与进程重启都不会改变任何历史批次的快照。
+- 每批在一个 `BEGIN IMMEDIATE` 事务内完成对象写入、提交序号分配与状态翻转；失败即
+  ROLLBACK，只留下标记 rejected 的批次审计行，不留半批，也不获得 `commit_seq`。
+- 解析在数据库写事务之外进行；gunicorn 使用 gthread 多线程 worker，慢批解析时另一批
+  仍可完成提交；导出只做只读快照查询，不会阻塞也不被提交阻塞。
+- 进程重启时，启动钩子只回滚**属主进程已不存在**的 `processing` 批次（按主机名 +
+  pid + 进程启动时刻判断），不会误杀其他 worker 正在解析的慢批。
+- **兼容已有数据卷**：`init_db` 以增量 `ALTER TABLE` 原地升级旧库，保留全部批次号、
+  对象历史与链接；旧批次（升级前已可见的结果）的 `commit_seq` 回填为其批次号，
+  精确复现升级前 `batch_id <= B` 的顺序视图，升级后仍可在详情页看到与升级前相同的
+  道路与待补全结果。升级后新上传的批次从更大的序号继续，且不会改变这些旧批快照。
 
 ## 样例文件（`samples/`，建议按编号顺序上传）
 
@@ -82,26 +99,33 @@ python -m gunicorn --bind 0.0.0.0:8000 --threads 4 wsgi:app
 ## 测试
 
 ```bash
-pip install pytest
+pip install -r requirements.txt pytest
 python -m pytest tests/ -v
 ```
 
-23 个用例覆盖：版本合并全部规则、缺节点补全、共享节点联动、改线、乱序、
-整批原子性、批次快照不可变、HTTP 上传/下载、并发写入与崩溃恢复。
+除版本合并、道路生成、HTTP 上传/下载等原有用例外，还包含针对并行上传快照的回归：
+
+- 慢批（低批次号）晚提交不改变先提交批次的快照，且自身快照包含先提交批次；
+- 解析中的批次不计入其他批次的快照；
+- 失败批不获得提交序号、不进入任何快照；
+- 重启前后各批快照一致、批次号不变；
+- 旧数据卷原地升级后，每个旧批次的可见结果与升级前 `batch_id <= B` 完全一致；
+- HTTP 层：解析中批次即出现在列表、详情链接固定可用，另一批上传与导出不被阻塞；
+- 启动钩子只回收属主已死的 `processing` 批次，保留存活 worker 的解析中批次。
 
 ## 目录结构
 
 ```
 app/
   config.py       环境变量配置
-  db.py           SQLite 连接、建表、重启恢复
+  db.py           SQLite 连接、建表、原地迁移、崩溃恢复
   osm_parser.py   .osm/.osc 严格解析（defusedxml）
-  ingestion.py    批次合并规则与单事务入仓
-  roads.py        as-of 快照重建、待补全判定、GeoJSON 序列化
+  ingestion.py    批次合并规则、提交序号与单事务入仓
+  roads.py        按 commit_seq 重建快照、待补全判定、GeoJSON 序列化
   web.py          Flask 路由
   templates/      中文网页模板
 samples/          10 个场景样例
-tests/            pytest 测试（23 用例）
+tests/            pytest 测试
 wsgi.py           gunicorn 入口
 Dockerfile / docker-compose.yml
 ```

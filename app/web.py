@@ -106,7 +106,10 @@ def create_app(db_path=None) -> Flask:
             abort(404)
 
         roads = pending = summary = None
-        if batch["status"] == "committed":
+        # Only a committed batch has a fixed snapshot.  A batch still being
+        # parsed is shown as 处理中 with its permanent detail URL; the view
+        # it will expose is frozen at the instant it commits.
+        if batch["status"] == "committed" and batch["commit_seq"] is not None:
             roads, pending = build_road_layer(conn, batch_id)
             summary = batch_summary(conn, batch_id)
         return render_template(
@@ -115,13 +118,17 @@ def create_app(db_path=None) -> Flask:
 
     @app.route("/batches/<int:batch_id>/geojson")
     def geojson(batch_id: int):
+        # Only a batch whose commit has fully landed can be exported.  The
+        # snapshot is anchored on the batch's fixed commit_seq and built
+        # from committed rows only, so this read never opens a write
+        # transaction and never blocks (or is blocked by) another upload.
         conn = get_conn()
         batch = conn.execute(
             "SELECT * FROM batches WHERE id = ?", (batch_id,)
         ).fetchone()
         if batch is None:
             abort(404)
-        if batch["status"] != "committed":
+        if batch["status"] != "committed" or batch["commit_seq"] is None:
             abort(409, description="该批次未成功提交，无法导出 GeoJSON")
 
         # Snapshot read only: never opens a write transaction, so concurrent

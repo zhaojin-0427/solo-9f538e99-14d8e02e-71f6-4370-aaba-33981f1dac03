@@ -23,7 +23,9 @@ VOLUME ["/data"]
 
 EXPOSE 8000
 
-# Two sync workers: writes are serialized by BEGIN IMMEDIATE while reads stay
-# lock-free in WAL mode; threads allow an export to proceed beside an upload
-# inside the same worker.
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "wsgi:app"]
+# gthread workers: each worker serves several requests concurrently, so a
+# slow upload parsing in one thread never blocks another upload or an
+# export handled by a sibling thread.  Parsing happens outside any database
+# write transaction, so two uploads can parse in parallel and commit in
+# whatever order they finish.
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--worker-class", "gthread", "--workers", "2", "--threads", "8", "--timeout", "600", "--access-logfile", "-", "--error-logfile", "-", "wsgi:app"]

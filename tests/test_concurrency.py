@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import os
+import socket
 import threading
 
 from app.db import connect, init_db
@@ -37,6 +39,82 @@ def test_restart_recovers_interrupted_batch(db_path):
     ).fetchone()
     assert leftover["n"] == 0
     conn2.close()
+
+
+def test_startup_hook_keeps_a_live_workers_in_flight_batch(db_path):
+    """Another worker booting must not roll back a batch still being parsed."""
+    conn = connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO batches (filename, status, owner_host, owner_pid, owner_start) "
+        "VALUES ('parsing.osc', 'processing', ?, ?, NULL)",
+        (socket.gethostname(), os.getpid()),
+    )
+    bid = cur.lastrowid
+    conn.close()
+
+    init_db(db_path)  # this process is alive: the batch is not interrupted
+
+    conn = connect(db_path)
+    try:
+        status = conn.execute(
+            "SELECT status FROM batches WHERE id=?", (bid,)
+        ).fetchone()["status"]
+    finally:
+        conn.close()
+    assert status == "processing"
+
+
+def test_startup_hook_rolls_back_a_dead_workers_batch(db_path):
+    dead_pid = 2 ** 22 + 12345  # never a live process on Linux
+    conn = connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO batches (filename, status, owner_host, owner_pid, owner_start) "
+        "VALUES ('dead.osc', 'processing', ?, ?, NULL)",
+        (socket.gethostname(), dead_pid),
+    )
+    bid = cur.lastrowid
+    conn.close()
+
+    init_db(db_path)
+
+    conn = connect(db_path)
+    try:
+        row = conn.execute("SELECT status, error FROM batches WHERE id=?", (bid,)).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "rejected"
+    assert "rolled back" in row["error"]
+
+
+def test_upload_reclaims_a_dead_workers_stale_batch(db_path):
+    """A leftover row from a killed worker is cleared on the next upload."""
+    dead_pid = 2 ** 22 + 54321
+    conn = connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO batches (filename, status, owner_host, owner_pid, owner_start) "
+        "VALUES ('orphan.osc', 'processing', ?, ?, NULL)",
+        (socket.gethostname(), dead_pid),
+    )
+    bid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO object_versions (object_type, object_id, version, visible, "
+        "lat, lon, tags_json, refs_json, batch_id) "
+        "VALUES ('node', 777, 1, 1, 1.0, 2.0, '{}', NULL, ?)",
+        (bid,),
+    )
+    try:
+        ingest_stream(conn, "01_base_extract.osm", io.BytesIO(sample_bytes("01_base_extract.osm")))
+        row = conn.execute("SELECT status FROM batches WHERE id=?", (bid,)).fetchone()
+        assert row["status"] == "rejected"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM object_versions WHERE batch_id=?", (bid,)
+        ).fetchone()["n"] == 0
+        # The current upload is untouched and committed normally.
+        assert conn.execute(
+            "SELECT status FROM batches WHERE id=?", (bid + 1,)
+        ).fetchone()["status"] == "committed"
+    finally:
+        conn.close()
 
 
 def test_concurrent_uploads_all_commit_or_are_rejected_cleanly(db_path):

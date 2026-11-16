@@ -7,8 +7,11 @@
     <button class="btn" type="submit">按批次入仓</button>
   </form>
   <p class="muted">
-    每个文件作为一个独立批次，解析与合并在单个事务内整体生效；同版异内容、含 relation 等情况会整批拒绝，不留半批。
-    旧版本自动忽略，重复同版自动跳过，删除以墓碑版本保留。
+    每个文件作为一个独立批次，上传开始即编号并进入列表，批次号与详情链接此后固定不变；
+    解析与合并在单个事务内整体生效，同版异内容、含 relation 等情况会整批拒绝，不留半批。
+    每批快照固定为提交瞬间的入仓状态（含本批及此前已提交批次，不含当时仍在解析或已失败的批次），
+    后续批次不会改变它。旧版本自动忽略，重复同版自动跳过，删除以墓碑版本保留。
+    解析较慢的批次不会阻塞其他批次提交或导出。
   </p>
 </div>
 
@@ -31,8 +34,8 @@
           {% if b.status == 'committed' %}已提交{% elif b.status == 'rejected' %}已拒绝{% else %}处理中{% endif %}
         </span></td>
         <td class="mono">{{ b.created_at }}</td>
-        <td>{{ row_counts[loop.index0] }}</td>
-        <td>{% if b.error %}<span class="mono" style="color:var(--err)">{{ b.error }}</span>{% else %}—{% endif %}</td>
+        <td>{% if b.status == 'committed' %}{{ row_counts[loop.index0] }}{% else %}—{% endif %}</td>
+        <td>{% if b.error %}<span class="mono" style="color:var(--err)">{{ b.error }}</span>{% elif b.status == 'processing' %}解析中，完成后按提交瞬间固定本批快照{% else %}—{% endif %}</td>
         <td>
           <a href="{{ url_for('batch_detail', batch_id=b.id) }}">详情</a>
           {% if b.status == 'committed' %}

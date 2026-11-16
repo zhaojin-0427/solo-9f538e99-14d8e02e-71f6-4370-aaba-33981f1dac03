@@ -1,15 +1,25 @@
 """Reconstruct the road layer as it was when any given batch was complete.
 
-Because ``object_versions`` is append-only, the state *as of* batch B is
-obtained by taking, for every object, the highest version whose
-``batch_id <= B``.  Nothing that arrived in later batches can leak into an
-earlier snapshot:
+``object_versions`` is append-only and every committed batch has a unique,
+strictly increasing ``commit_seq`` assigned at commit time.  The state *as
+of* batch B is obtained by taking, for every object, the highest version
+among rows whose batch carries ``commit_seq <= B.commit_seq``.
 
+That is deliberately commit order rather than batch-id order: ids are
+reserved when an upload *starts*, so a slow-parsing batch may have a lower
+id but commit after another batch.  Anchoring on ``commit_seq`` gives each
+batch exactly the warehouse state at the instant it committed -- itself plus
+every batch committed before it, and nothing that was still parsing at that
+moment.  Consequences:
+
+* a batch still parsing (or later rejected) never appears in any snapshot;
+* a later commit can never retroactively change an earlier batch's geometry,
+  pending list or statistics, no matter which id it was given;
 * a shared node moving in batch 5 changes every affected way's geometry in
   batch 5's export even when the way itself is never re-uploaded;
 * the same way's geometry in the batch 3 export is still built from the
-  node coordinates stored up to batch 3;
-* a deleted referenced node (or one never yet uploaded) makes the whole way
+  node coordinates fixed by batch 3;
+* a deleted referenced node (or one not yet committed) makes the whole way
   pending until a later batch supplies a visible version;
 * once a way's references change, its old node ids no longer influence it.
 """
@@ -42,31 +52,47 @@ class PendingWay:
     missing_node_ids: list[int]
 
 
-def _current_objects(conn: sqlite3.Connection, batch_id: int) -> dict[tuple, sqlite3.Row]:
-    """Return each object's highest-version state visible up to ``batch_id``."""
+def _batch_commit_seq(conn: sqlite3.Connection, batch_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT commit_seq FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    return None if row is None else row["commit_seq"]
+
+
+def _current_objects(conn: sqlite3.Connection, commit_seq: int) -> dict[tuple, sqlite3.Row]:
+    """Return each object's highest-version state committed up to ``commit_seq``."""
     rows = conn.execute(
         """
         SELECT o.*
         FROM object_versions o
+        JOIN batches b ON b.id = o.batch_id
         JOIN (
-            SELECT object_type, object_id, MAX(version) AS max_version
-            FROM object_versions
-            WHERE batch_id <= ?
-            GROUP BY object_type, object_id
+            SELECT ov.object_type, ov.object_id, MAX(ov.version) AS max_version
+            FROM object_versions ov
+            JOIN batches ob ON ob.id = ov.batch_id
+            WHERE ob.commit_seq <= ? AND ob.status = 'committed'
+            GROUP BY ov.object_type, ov.object_id
         ) m
           ON o.object_type = m.object_type
          AND o.object_id = m.object_id
          AND o.version = m.max_version
-        WHERE o.batch_id <= ?
+        WHERE b.commit_seq <= ? AND b.status = 'committed'
         """,
-        (batch_id, batch_id),
+        (commit_seq, commit_seq),
     ).fetchall()
     return {(row["object_type"], row["object_id"]): row for row in rows}
 
 
 def build_road_layer(conn: sqlite3.Connection, batch_id: int):
-    """Build (roads, pending_ways) for the committed batch ``batch_id``."""
-    objects = _current_objects(conn, batch_id)
+    """Build (roads, pending_ways) for the committed batch ``batch_id``.
+
+    Returns ``([], [])`` for a batch that never committed; callers that need
+    to distinguish "rejected" from "empty" check the batch status first.
+    """
+    seq = _batch_commit_seq(conn, batch_id)
+    if seq is None:
+        return [], []
+    objects = _current_objects(conn, seq)
     roads: list[RoadFeature] = []
     pending: list[PendingWay] = []
 
@@ -129,24 +155,30 @@ def road_geojson(roads: list[RoadFeature]) -> dict:
 
 
 def batch_summary(conn: sqlite3.Connection, batch_id: int) -> dict:
-    """Object counts visible as of a batch, for the detail page."""
+    """Object counts fixed by a batch's commit, for the detail page."""
+    summary = {"node_visible": 0, "node_deleted": 0, "way_visible": 0, "way_deleted": 0}
+    seq = _batch_commit_seq(conn, batch_id)
+    if seq is None:
+        return summary
     rows = conn.execute(
         """
-        SELECT object_type,
-               SUM(CASE WHEN visible = 1 THEN 1 ELSE 0 END) AS visible_count,
-               SUM(CASE WHEN visible = 0 THEN 1 ELSE 0 END) AS deleted_count
-        FROM object_versions
-        WHERE (object_type, object_id, version) IN (
-            SELECT object_type, object_id, MAX(version)
-            FROM object_versions
-            WHERE batch_id <= ?
-            GROUP BY object_type, object_id
-        )
-        GROUP BY object_type
+        SELECT o.object_type,
+               SUM(CASE WHEN o.visible = 1 THEN 1 ELSE 0 END) AS visible_count,
+               SUM(CASE WHEN o.visible = 0 THEN 1 ELSE 0 END) AS deleted_count
+        FROM object_versions o
+        JOIN batches b ON b.id = o.batch_id
+        WHERE b.commit_seq <= ? AND b.status = 'committed'
+          AND (o.object_type, o.object_id, o.version) IN (
+              SELECT ov.object_type, ov.object_id, MAX(ov.version)
+              FROM object_versions ov
+              JOIN batches ob ON ob.id = ov.batch_id
+              WHERE ob.commit_seq <= ? AND ob.status = 'committed'
+              GROUP BY ov.object_type, ov.object_id
+          )
+        GROUP BY o.object_type
         """,
-        (batch_id,),
+        (seq, seq),
     ).fetchall()
-    summary = {"node_visible": 0, "node_deleted": 0, "way_visible": 0, "way_deleted": 0}
     for row in rows:
         prefix = "node" if row["object_type"] == "node" else "way"
         summary[f"{prefix}_visible"] = row["visible_count"]
